@@ -1,0 +1,196 @@
+package br.italo.italophone
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.content.res.Configuration
+import android.graphics.PixelFormat
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.WindowManager
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.io.OutputStream
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
+import kotlin.concurrent.thread
+
+// Uma faixa invisivel de 3 px na borda do celular que fica do lado do notebook.
+// Quando a setinha do mouse passa por cima dela, o Android manda eventos de "hover"
+// com a posicao exata; o notebook usa isso para devolver o mouse ao Windows.
+//
+// O notebook conecta por adb forward na porta 27440 e manda:
+//   "B lado"   mostra a faixa (0 esquerda, 1 direita, 2 cima, 3 baixo); "B -1" esconde
+// O celular manda:
+//   "S largura altura"        ao conectar e quando gira
+//   "H dentro posicao"        setinha na faixa (dentro 1/0), posicao em px ao longo da borda
+class Borda : Service() {
+    private val porta = 27440
+    private val espessura = 3
+    private val main = Handler(Looper.getMainLooper())
+    private lateinit var wm: WindowManager
+    private var faixa: View? = null
+    private var lado = -1
+    @Volatile private var saida: OutputStream? = null
+    @Volatile private var cliente: Socket? = null
+    private var servidor: ServerSocket? = null
+    @Volatile private var vivo = true
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        wm = getSystemService(WindowManager::class.java)
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(NotificationChannel("borda", "Mouse do notebook", NotificationManager.IMPORTANCE_MIN))
+        val n = Notification.Builder(this, "borda")
+            .setSmallIcon(R.drawable.icone)
+            .setContentTitle("Italophone")
+            .setContentText("Mouse e teclado do notebook")
+            .setOngoing(true)
+            .build()
+        if (Build.VERSION.SDK_INT >= 34) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        else startForeground(1, n)
+        thread(name = "servidor") { servir() }
+        thread(name = "remetente", isDaemon = true) { remeter() }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+
+    override fun onDestroy() {
+        vivo = false
+        try { servidor?.close() } catch (_: Exception) {}
+        try { cliente?.close() } catch (_: Exception) {}
+        main.post { mostrar(-1) }
+        super.onDestroy()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        main.postDelayed({ mandarTamanho(); if (lado >= 0) { val l = lado; mostrar(-1); mostrar(l) } }, 300)
+    }
+
+    private fun tamanho(): Pair<Int, Int> {
+        if (Build.VERSION.SDK_INT >= 30) {
+            val b = wm.maximumWindowMetrics.bounds
+            return Pair(b.width(), b.height())
+        }
+        @Suppress("DEPRECATION")
+        val p = android.graphics.Point().also { wm.defaultDisplay.getRealSize(it) }
+        return Pair(p.x, p.y)
+    }
+
+    // um remetente so, em ordem: "H 1" e "H 0" seguidos nunca chegam trocados ao notebook
+    private val fila = java.util.concurrent.LinkedBlockingQueue<String>()
+
+    private fun enviar(s: String) {
+        if (saida == null) return
+        fila.offer(s)
+    }
+
+    private fun remeter() {
+        while (vivo) {
+            val s = try { fila.take() } catch (_: InterruptedException) { break }
+            val o = saida ?: continue
+            try { o.write((s + "\n").toByteArray()); o.flush() } catch (_: Exception) {}
+        }
+    }
+
+    private fun mandarTamanho() {
+        val (w, h) = tamanho()
+        enviar("S $w $h")
+    }
+
+    private fun servir() {
+        while (vivo) {
+            try {
+                val ss = ServerSocket(porta, 2, InetAddress.getByName("127.0.0.1"))
+                servidor = ss
+                while (vivo) {
+                    val c = ss.accept()
+                    c.tcpNoDelay = true
+                    try { cliente?.close() } catch (_: Exception) {}
+                    cliente = c
+                    fila.clear()
+                    saida = c.getOutputStream()
+                    main.post { mandarTamanho() }
+                    thread(name = "cliente") { atender(c) }
+                }
+            } catch (_: Exception) {
+                if (vivo) Thread.sleep(1000)
+            }
+        }
+    }
+
+    private fun atender(c: Socket) {
+        try {
+            val r = BufferedReader(InputStreamReader(c.getInputStream()))
+            while (vivo) {
+                val l = r.readLine() ?: break
+                val p = l.trim().split(' ')
+                if (p[0] == "B" && p.size == 2) {
+                    val novo = p[1].toIntOrNull() ?: -1
+                    main.post { mostrar(novo) }
+                }
+            }
+        } catch (_: Exception) {
+        } finally {
+            try { c.close() } catch (_: Exception) {}
+            if (cliente === c) main.post { mostrar(-1) }
+        }
+    }
+
+    private fun mostrar(novo: Int) {
+        faixa?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+        faixa = null
+        lado = novo
+        if (novo !in 0..3) return
+        val (w, h) = tamanho()
+        val vertical = novo == 0 || novo == 1
+        val lp = WindowManager.LayoutParams(
+            if (vertical) espessura else w,
+            if (vertical) h else espessura,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = when (novo) {
+                0 -> Gravity.LEFT or Gravity.TOP
+                1 -> Gravity.RIGHT or Gravity.TOP
+                2 -> Gravity.LEFT or Gravity.TOP
+                else -> Gravity.LEFT or Gravity.BOTTOM
+            }
+            x = 0; y = 0
+            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+            if (Build.VERSION.SDK_INT >= 30) setFitInsetsTypes(0)
+            title = "Italophone borda"
+        }
+        val v = View(this)
+        v.setOnHoverListener { _, e ->
+            val pos = if (vertical) e.rawY else e.rawX
+            when (e.actionMasked) {
+                MotionEvent.ACTION_HOVER_ENTER, MotionEvent.ACTION_HOVER_MOVE -> enviar("H 1 ${pos.toInt()}")
+                MotionEvent.ACTION_HOVER_EXIT -> enviar("H 0 ${pos.toInt()}")
+            }
+            true
+        }
+        // a faixa so existe enquanto o mouse do notebook esta no celular. Sem a permissao de
+        // sobrepor (alguns aparelhos negam), segue sem ela: o notebook devolve o mouse pela estimativa.
+        try {
+            wm.addView(v, lp)
+            faixa = v
+        } catch (_: Exception) {
+        }
+    }
+}

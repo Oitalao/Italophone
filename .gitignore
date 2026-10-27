@@ -1,0 +1,12 @@
+dist/
+android/build/
+android/app/build/
+android/.gradle/
+android/.kotlin/
+android/local.properties
+servidor/classes/
+servidor/saida.zip
+*.exe
+*.jar
+!android/gradle/wrapper/gradle-wrapper.jar
+servidor/local.ps1
