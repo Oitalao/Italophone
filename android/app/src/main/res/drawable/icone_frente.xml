@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <!-- Símbolo: branco com detalhe laranja, na área segura do ícone adaptável -->
+    <group android:scaleX="0.140625" android:scaleY="0.140625" android:translateX="18" android:translateY="18">
+        <path android:strokeColor="#FFFFFF" android:strokeWidth="30" android:pathData="M206,80h100a46,46 0 0 1 46,46v260a46,46 0 0 1 -46,46h-100a46,46 0 0 1 -46,-46v-260a46,46 0 0 1 46,-46z"/>
+        <path android:fillColor="#FFFFFF" android:pathData="M238,108h36a6,6 0 0 1 6,6v0a6,6 0 0 1 -6,6h-36a6,6 0 0 1 -6,-6v-0a6,6 0 0 1 6,-6z"/>
+        <path android:fillColor="#F07A12" android:strokeColor="#F07A12" android:strokeWidth="10" android:strokeLineJoin="round" android:pathData="M206,182L206,326L242,294L267,347L291,336L266,284L316,284Z"/>
+    </group>
+</vector>

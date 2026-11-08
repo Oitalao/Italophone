@@ -7,7 +7,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <application
         android:label="Italophone"
-        android:icon="@drawable/icone"
+        android:icon="@mipmap/icone_app"
+        android:roundIcon="@mipmap/icone_app"
         android:allowBackup="false">
         <activity
             android:name=".MainActivity"

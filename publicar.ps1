@@ -2,7 +2,7 @@
 # Os programas prontos vêm da pasta acima de "fontes" (onde build.cmd e servidor\build.ps1 gravam):
 #   Italophone.exe, italophone-servidor.jar, Italophone.apk, icone\ e scrcpy\ (scrcpy oficial,
 #   https://github.com/Genymobile/scrcpy, com o adb).
-param([string]$Versao = "1.0.0")
+param([string]$Versao = "1.1.0")
 $ErrorActionPreference = 'Stop'
 $fontes = $PSScriptRoot
 $programa = Split-Path $fontes -Parent
