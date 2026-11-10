@@ -6,6 +6,9 @@
 //   O teclado vai junto. Levando a setinha de volta a borda do celular, o mouse volta ao Windows.
 // - Som: o som do celular toca no notebook (scrcpy, so audio).
 // - Tela: opcional, mostra a tela do celular numa janela (scrcpy).
+// - Area de transferencia: copiar texto em qualquer lado poe no outro. O Android bloqueia a
+//   leitura da area de transferencia em segundo plano a quem nao for o teclado padrao; por isso o
+//   celular vira o proprio teclado (vazio) enquanto conectado e volta ao de antes ao desconectar.
 
 using System;
 using System.Collections.Concurrent;
@@ -54,6 +57,7 @@ static class Nat
     [DllImport("user32.dll")] public static extern IntPtr SetCursor(IntPtr h);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint f);
     [DllImport("user32.dll")] public static extern bool PostThreadMessage(int tid, int msg, IntPtr w, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool AddClipboardFormatListener(IntPtr hwnd);
     [DllImport("kernel32.dll")] public static extern int GetCurrentThreadId();
 }
 
@@ -67,7 +71,7 @@ class Config
     public double Escala = 0;                // tamanho: pixels do celular por pixel do Windows (0 = automatico)
     public double Velocidade = 0;            // pixels do celular andados por pixel do Windows (0 = padrao)
     public const double VelocidadePadrao = 1.5;
-    public bool Mouse = true, Som = true, Midia = true;   // Midia: teclas de volume e musica vao para o celular
+    public bool Mouse = true, Som = true, Midia = true, Clip = true;   // Midia: teclas de volume e musica vao para o celular; Clip: area de transferencia
     public int CelW = 1080, CelH = 2400;     // ultimo tamanho conhecido da tela do celular
 
     readonly string arq;
@@ -97,6 +101,7 @@ class Config
                     case "mouse": Mouse = v != "0"; break;
                     case "som": Som = v != "0"; break;
                     case "midia": Midia = v != "0"; break;
+                    case "clip": Clip = v != "0"; break;
                     case "tela_celular":
                         var t = v.Split('x');
                         CelW = int.Parse(t[0]); CelH = int.Parse(t[1]);
@@ -120,6 +125,7 @@ class Config
         sb.AppendLine("mouse=" + (Mouse ? 1 : 0));
         sb.AppendLine("som=" + (Som ? 1 : 0));
         sb.AppendLine("midia=" + (Midia ? 1 : 0));
+        sb.AppendLine("clip=" + (Clip ? 1 : 0));
         sb.AppendLine("tela_celular=" + CelW + "x" + CelH);
         try { File.WriteAllText(arq, sb.ToString(), new UTF8Encoding(false)); } catch { }
     }
@@ -424,6 +430,7 @@ class AppBorda
     public volatile int PosBorda;
     public int W, H;
     public event Action<int, int> Tamanho;
+    public event Action<string> ClipRecebido;
 
     public bool Conectar(int porta)
     {
@@ -458,6 +465,15 @@ class AppBorda
                     int w = int.Parse(p[1]), h = int.Parse(p[2]);
                     if (w != W || h != H) { W = w; H = h; var ev = Tamanho; if (ev != null) ev(w, h); }
                 }
+                else if (p[0] == "C" && p.Length == 2)
+                {
+                    try
+                    {
+                        string texto = Encoding.UTF8.GetString(Convert.FromBase64String(p[1]));
+                        var ev = ClipRecebido; if (ev != null) ev(texto);
+                    }
+                    catch { }
+                }
             }
         }
         catch { }
@@ -472,6 +488,12 @@ class AppBorda
     }
 
     public void Fechar() { Pronto = false; try { if (cli != null) cli.Close(); } catch { } }
+
+    public void EnviarClip(string texto)
+    {
+        try { var b = Encoding.ASCII.GetBytes("T " + Convert.ToBase64String(Encoding.UTF8.GetBytes(texto)) + "\n"); st.Write(b, 0, b.Length); }
+        catch { Pronto = false; }
+    }
 }
 
 // ===================================================================== janelinha que esconde o cursor
@@ -487,6 +509,7 @@ class Capa : Form
         }
     }
     protected override bool ShowWithoutActivation { get { return true; } }
+    public event Action ClipboardMudou;
     public Capa()
     {
         FormBorderStyle = FormBorderStyle.None;
@@ -500,6 +523,7 @@ class Capa : Form
     {
         if (m.Msg == 0x20) { Nat.SetCursor(IntPtr.Zero); m.Result = (IntPtr)1; return; }   // WM_SETCURSOR: sem cursor
         if (m.Msg == 0x21) { m.Result = (IntPtr)3; return; }   // WM_MOUSEACTIVATE: nao ativar
+        if (m.Msg == 0x031D) { var ev = ClipboardMudou; if (ev != null) ev(); }   // WM_CLIPBOARDUPDATE
         base.WndProc(ref m);
     }
     public void Cobrir(int x, int y)
@@ -528,7 +552,7 @@ class App : ApplicationContext
 {
     const int PORTA_SERVIDOR = 27450, PORTA_APP = 27440;
     const string APP_CELULAR = "br.italo.italophone";
-    const int VERSAO_APP = 4;   // versionCode do Italophone.apk que vai junto
+    const int VERSAO_APP = 10;   // versionCode do Italophone.apk que vai junto
     const string JAR_CELULAR = "/data/local/tmp/italophone-servidor.jar";
 
     public readonly string Dir = AppDomain.CurrentDomain.BaseDirectory;
@@ -537,7 +561,7 @@ class App : ApplicationContext
     SynchronizationContext ui;
 
     readonly NotifyIcon ni = new NotifyIcon();
-    ToolStripMenuItem miMouse, miSom, miTela, miMidia;
+    ToolStripMenuItem miMouse, miSom, miTela, miMidia, miClip;
     Icon icOk, icDentro, icEsperando, icPausado;
     string estado = "";
 
@@ -557,6 +581,7 @@ class App : ApplicationContext
     DateTime proxServidor = DateTime.MinValue, proxApp = DateTime.MinValue;
     bool appPreparado, jarEnviado;
     volatile bool presente;
+    string clipUltimoEnviado;
 
     // mouse
     volatile Geometria geo;
@@ -619,8 +644,11 @@ class App : ApplicationContext
         ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
         capa = new Capa();
         var h = capa.Handle;   // cria a janela na thread da interface
+        Nat.AddClipboardFormatListener(h);
+        capa.ClipboardMudou += () => ClipboardMudouLocal();
 
         borda.Tamanho += (w, hh) => ui.Post(_ => NovoTamanho(w, hh), null);
+        borda.ClipRecebido += texto => ui.Post(_ => ClipDoCelularRecebido(texto), null);
         AtualizarGeometria();
         Microsoft.Win32.SystemEvents.DisplaySettingsChanged += (s, e) => ui.Post(_ => AtualizarGeometria(), null);
 
@@ -736,6 +764,8 @@ class App : ApplicationContext
         miMouse.Click += (s, e) => { Cfg.Mouse = !Cfg.Mouse; miMouse.Checked = Cfg.Mouse; Cfg.Gravar(); if (!Cfg.Mouse && dentro) Sair_(-1); Ciclo(); };
         miMidia = new ToolStripMenuItem("Teclas de volume e música no celular") { Checked = Cfg.Midia };
         miMidia.Click += (s, e) => { Cfg.Midia = !Cfg.Midia; miMidia.Checked = Cfg.Midia; Cfg.Gravar(); };
+        miClip = new ToolStripMenuItem("Área de transferência compartilhada com o celular") { Checked = Cfg.Clip };
+        miClip.Click += (s, e) => { Cfg.Clip = !Cfg.Clip; miClip.Checked = Cfg.Clip; Cfg.Gravar(); };
         miTela = new ToolStripMenuItem("Mostrar a tela do celular");
         miTela.Click += (s, e) => AlternarTela();
         miSom = new ToolStripMenuItem("Som do celular no notebook") { Checked = Cfg.Som };
@@ -766,11 +796,12 @@ class App : ApplicationContext
             "Em \"Organizar telas\" você arrasta o celular para o lado certo e ajusta a velocidade.\n\n" +
             "\"Mostrar a tela do celular\" abre uma janela com a tela dele. Fechar essa janela não fecha o Italophone.\n\n" +
             "O som do celular toca no notebook enquanto o cabo estiver ligado.\n\n" +
+            "A área de transferência é compartilhada: copiar em qualquer lado cola no outro. Enquanto o cabo está ligado, o celular usa um teclado vazio (sem Gboard) para poder ler a área de transferência dele; o Gboard volta sozinho ao desconectar.\n\n" +
             "Com mais de um celular no cabo, escolha qual usar em \"Celular\".",
             "Italophone");
         var miSair = new ToolStripMenuItem("Sair");
         miSair.Click += (s, e) => Encerrar();
-        menu.Items.AddRange(new ToolStripItem[] { miMouse, miMidia, miTela, miSom, new ToolStripSeparator(), miCel, miOrg, miAjuda, miSair });
+        menu.Items.AddRange(new ToolStripItem[] { miMouse, miMidia, miClip, miTela, miSom, new ToolStripSeparator(), miCel, miOrg, miAjuda, miSair });
         ni.ContextMenuStrip = menu;
         ni.DoubleClick += (s, e) => Organizar();
         ni.Visible = true;
@@ -991,6 +1022,11 @@ class App : ApplicationContext
             }
             Adb("-s " + Cfg.Celular + " shell appops set " + APP_CELULAR + " SYSTEM_ALERT_WINDOW allow");
             Adb("-s " + Cfg.Celular + " shell pm grant " + APP_CELULAR + " android.permission.POST_NOTIFICATIONS");
+            // deixa o celular trocar de teclado por conta propria (ver Borda.kt), para ler a area
+            // de transferencia dele; o proprio celular desfaz a troca ao desconectar. O "ime enable"
+            // fica aqui (habilitar exige so o adb, nao precisa ser lido pelo app depois).
+            Adb("-s " + Cfg.Celular + " shell pm grant " + APP_CELULAR + " android.permission.WRITE_SECURE_SETTINGS");
+            Adb("-s " + Cfg.Celular + " shell ime enable " + APP_CELULAR + "/.ClipboardIme");
             appPreparado = true;
         }
         Adb("-s " + Cfg.Celular + " shell am start-foreground-service -n " + APP_CELULAR + "/.Borda");
@@ -1010,6 +1046,27 @@ class App : ApplicationContext
     public void AtualizarGeometria()
     {
         geo = Geometria.De(Cfg, Cfg.CelW, Cfg.CelH);
+    }
+
+    // ---------------------------------------------------------------- area de transferencia, nos dois sentidos
+    // (ver Borda.kt: o celular vira o teclado padrao por conta propria para poder ler a dele).
+    // clipUltimoEnviado guarda o ultimo texto trocado por qualquer lado, para nao ecoar de volta.
+    void ClipboardMudouLocal()
+    {
+        if (!Cfg.Clip) return;
+        string texto;
+        try { if (!Clipboard.ContainsText()) return; texto = Clipboard.GetText(); }
+        catch { return; }   // area de transferencia presa por outro programa nesse instante
+        if (string.IsNullOrEmpty(texto) || texto == clipUltimoEnviado) return;
+        clipUltimoEnviado = texto;
+        if (borda.Pronto) borda.EnviarClip(texto);
+    }
+
+    void ClipDoCelularRecebido(string texto)
+    {
+        if (!Cfg.Clip || string.IsNullOrEmpty(texto) || texto == clipUltimoEnviado) return;
+        clipUltimoEnviado = texto;
+        try { Clipboard.SetText(texto); } catch { }
     }
 
     // ---------------------------------------------------------------- scrcpy

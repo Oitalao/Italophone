@@ -10,8 +10,8 @@ android {
         applicationId = "br.italo.italophone"
         minSdk = 30
         targetSdk = 36
-        versionCode = 6
-        versionName = "1.1.0"
+        versionCode = 10
+        versionName = "1.3.0"
     }
     buildTypes {
         release {

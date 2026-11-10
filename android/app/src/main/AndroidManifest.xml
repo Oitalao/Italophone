@@ -5,6 +5,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
     <application
         android:label="Italophone"
         android:icon="@mipmap/icone_app"
@@ -27,6 +28,16 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Avisa o notebook quando a setinha do mouse chega na borda (Italophone)" />
+        </service>
+        <service
+            android:name=".ClipboardIme"
+            android:exported="true"
+            android:permission="android.permission.BIND_INPUT_METHOD"
+            android:label="Italophone">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data android:name="android.view.im" android:resource="@xml/metodo" />
         </service>
     </application>
 </manifest>
