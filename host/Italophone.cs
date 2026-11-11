@@ -18,10 +18,14 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Globalization;
 using System.IO;
+using System.Linq;
+using System.Net.Http;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("Italophone")]
@@ -74,6 +78,97 @@ class Config
     public bool Mouse = true, Som = true, Midia = true, Clip = true;   // Midia: teclas de volume e musica vao para o celular; Clip: area de transferencia
     public int CelW = 1080, CelH = 2400;     // ultimo tamanho conhecido da tela do celular
 
+    // macros de teclado -> celular, so com o mouse dentro dele. Configuraveis pelo menu
+    // ("Configurar atalhos...") ou, direto no config.txt, uma linha por atalho:
+    //   macro=<combo>=<acao>
+    // combo: ctrl/alt/shift/win (0 ou mais) + uma tecla, separados por "+" (ex.: "ctrl+alt+c",
+    // "calculadora", "proxima"). Teclas aceitas: letras, numeros, f1..f24, as teclas de volume e
+    // midia (mudo/volmenos/volmais/proxima/anterior/parar/tocapausa), as teclas de atalho do
+    // teclado que existirem (correio/midia/app1/calculadora),
+    // esc/tab/espaco/enter/home/fim/delete/insert/pageup/pagedown/cima/baixo/esquerda/direita, ou
+    // qualquer outra tecla pelo codigo Windows ("vk186" etc., o que o menu usa para o que nao tem
+    // nome definido aqui).
+    // acao: nome de pacote Android (abre o app) ou voltar/home/recentes/notificacoes.
+    // Ex.: macro=ctrl+alt+c=com.google.android.calculator
+    public class ItemMacro { public string Combo, Acao; }
+    public readonly List<ItemMacro> Lista = new List<ItemMacro>();                      // atalhos, na ordem do arquivo
+    public readonly Dictionary<long, string> Macros = new Dictionary<long, string>();   // combo (chave) -> acao, p/ o gancho
+
+    static readonly Dictionary<string, int> NomeParaVk = ConstruirNomes();
+    static readonly Dictionary<int, string> VkParaNome = ConstruirNomesInverso();
+    static Dictionary<string, int> ConstruirNomes()
+    {
+        var d = new Dictionary<string, int>();
+        for (char c = 'a'; c <= 'z'; c++) d[c.ToString()] = c - 'a' + 0x41;
+        for (char c = '0'; c <= '9'; c++) d[c.ToString()] = c - '0' + 0x30;
+        for (int i = 1; i <= 24; i++) d["f" + i] = 0x70 + i - 1;
+        d["mudo"] = 0xAD; d["volmenos"] = 0xAE; d["volmais"] = 0xAF;
+        d["proxima"] = 0xB0; d["anterior"] = 0xB1; d["parar"] = 0xB2; d["tocapausa"] = 0xB3;
+        d["correio"] = 0xB4; d["midia"] = 0xB5; d["app1"] = 0xB6; d["calculadora"] = 0xB7;
+        d["esc"] = 0x1B; d["tab"] = 0x09; d["espaco"] = 0x20; d["enter"] = 0x0D;
+        d["home"] = 0x24; d["fim"] = 0x23; d["delete"] = 0x2E; d["insert"] = 0x2D;
+        d["pageup"] = 0x21; d["pagedown"] = 0x22;
+        d["cima"] = 0x26; d["baixo"] = 0x28; d["esquerda"] = 0x25; d["direita"] = 0x27;
+        return d;
+    }
+    static Dictionary<int, string> ConstruirNomesInverso()
+    {
+        var d = new Dictionary<int, string>();
+        foreach (var kv in NomeParaVk) if (!d.ContainsKey(kv.Value)) d[kv.Value] = kv.Key;
+        return d;
+    }
+
+    // uma combinacao vira um numero so: 4 bits de modificador + o vk. Usado tanto para guardar o
+    // que veio do config.txt quanto para procurar, a cada tecla, o que esta pressionado agora.
+    public static long ChaveCombo(bool ctrl, bool alt, bool shift, bool win, int vk)
+    {
+        return (ctrl ? 1L : 0) | (alt ? 2L : 0) | (shift ? 4L : 0) | (win ? 8L : 0) | ((long)vk << 4);
+    }
+
+    // texto de um combo a partir do que esta pressionado agora (usado pelo "Configurar atalhos...")
+    public static string TextoCombo(bool ctrl, bool alt, bool shift, bool win, int vk)
+    {
+        var partes = new List<string>();
+        if (ctrl) partes.Add("ctrl");
+        if (alt) partes.Add("alt");
+        if (shift) partes.Add("shift");
+        if (win) partes.Add("win");
+        string nome;
+        partes.Add(VkParaNome.TryGetValue(vk, out nome) ? nome : ("vk" + vk));
+        return string.Join("+", partes);
+    }
+
+    public static bool AnalisarCombo(string combo, out long chave)
+    {
+        chave = 0;
+        bool ctrl = false, alt = false, shift = false, win = false; int vk = -1, v;
+        foreach (var bruto in combo.Split('+'))
+        {
+            string tok = bruto.Trim().ToLowerInvariant();
+            if (tok == "ctrl") ctrl = true;
+            else if (tok == "alt") alt = true;
+            else if (tok == "shift") shift = true;
+            else if (tok == "win") win = true;
+            else if (NomeParaVk.TryGetValue(tok, out v)) vk = v;
+            else if (tok.StartsWith("vk") && int.TryParse(tok.Substring(2), out v)) vk = v;
+            else return false;
+        }
+        if (vk < 0) return false;
+        chave = ChaveCombo(ctrl, alt, shift, win, vk);
+        return true;
+    }
+
+    // refaz o dicionario usado pelo gancho a partir da lista (depois de adicionar/editar/remover um atalho)
+    public void ReconstruirMacros()
+    {
+        Macros.Clear();
+        foreach (var m in Lista)
+        {
+            long chave;
+            if (AnalisarCombo(m.Combo, out chave)) Macros[chave] = m.Acao;
+        }
+    }
+
     readonly string arq;
     public Config(string arq) { this.arq = arq; Ler(); }
 
@@ -102,6 +197,10 @@ class Config
                     case "som": Som = v != "0"; break;
                     case "midia": Midia = v != "0"; break;
                     case "clip": Clip = v != "0"; break;
+                    case "macro":
+                        var mp = v.Split(new[] { '=' }, 2);
+                        if (mp.Length == 2) Lista.Add(new ItemMacro { Combo = mp[0].Trim(), Acao = mp[1].Trim() });
+                        break;
                     case "tela_celular":
                         var t = v.Split('x');
                         CelW = int.Parse(t[0]); CelH = int.Parse(t[1]);
@@ -110,6 +209,7 @@ class Config
             }
             catch { }
         }
+        ReconstruirMacros();
     }
 
     public void Gravar()
@@ -127,6 +227,7 @@ class Config
         sb.AppendLine("midia=" + (Midia ? 1 : 0));
         sb.AppendLine("clip=" + (Clip ? 1 : 0));
         sb.AppendLine("tela_celular=" + CelW + "x" + CelH);
+        foreach (var m in Lista) sb.AppendLine("macro=" + m.Combo + "=" + m.Acao);
         try { File.WriteAllText(arq, sb.ToString(), new UTF8Encoding(false)); } catch { }
     }
 }
@@ -597,6 +698,11 @@ class App : ApplicationContext
     readonly byte[] relTeclado = new byte[8];
     readonly List<byte> teclasNoCelular = new List<byte>();
     readonly HashSet<int> vkNoCelular = new HashSet<int>();
+    readonly HashSet<int> teclasMacro = new HashSet<int>();   // vk's de macro ja disparados (ainda seguradas)
+    // estado de ctrl/alt/shift/win, atualizado a mao a partir do proprio gancho (ver GanchoTeclado):
+    // o GetAsyncKeyState do codigo generico (0x11/0x12/0x10) nao refletia de forma confiavel o
+    // especifico de lado que o teclado dele manda (0xA2/0xA3 etc.) — confirmado por log e teste isolado
+    bool modCtrl, modAlt, modShift, modWin;
     Capa capa;
     Thread ganchoThread;
     int ganchoTid;
@@ -608,6 +714,7 @@ class App : ApplicationContext
         logArq = Path.Combine(Dir, "italophone.log");
         scrcpyExe = Path.Combine(Dir, @"scrcpy\scrcpy.exe");
         Cfg = new Config(Path.Combine(Dir, "config.txt"));
+        NomesApp.Inicializar(Path.Combine(Dir, "nomes_apps.txt"));
         adb = AcharAdb();
         Environment.SetEnvironmentVariable("ADB", adb);
         serv = new Servidor(this);
@@ -719,7 +826,62 @@ class App : ApplicationContext
         }
     }
 
-    string Adb(string args, int ms = 5000)
+    // executa a acao de uma macro no celular: um pacote abre o app (sem precisar saber o nome da
+    // activity principal); os nomes especiais mandam a tecla/comando equivalente. Roda fora da
+    // linha do gancho de teclado, que nao pode travar.
+    // nomes de acao fixa aceitos pela macro e o texto pro menu "Configurar atalhos..."
+    public static readonly string[] AcoesFixas = { "voltar", "home", "recentes", "notificacoes", "print", "reiniciar", "desligar", "mudo", "wifi", "dados", "bluetooth", "rotacao", "nfc" };
+    public static readonly string[] AcoesFixasTexto = { "Voltar", "Tela inicial", "Apps recentes", "Notificações", "Tirar print", "Reiniciar o celular", "Desligar o celular", "Mudo (alternar)", "Wi-Fi (ligar/desligar)", "Dados móveis (ligar/desligar)", "Bluetooth (ligar/desligar)", "Rotação automática (ligar/desligar)", "NFC (ligar/desligar)" };
+
+    void DispararMacro(string acao)
+    {
+        string cel = Cfg.Celular;
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            switch (acao)
+            {
+                case "voltar": Adb("-s " + cel + " shell input keyevent 4", 8000); break;
+                case "home": Adb("-s " + cel + " shell input keyevent 3", 8000); break;
+                case "recentes": Adb("-s " + cel + " shell input keyevent 187", 8000); break;
+                case "notificacoes": Adb("-s " + cel + " shell cmd statusbar expand-notifications", 8000); break;
+                case "print": Adb("-s " + cel + " shell input keyevent 120", 8000); break;           // KEYCODE_SYSRQ: print nativo (fica na galeria)
+                case "reiniciar": Adb("-s " + cel + " reboot", 15000); break;
+                case "desligar": Adb("-s " + cel + " shell reboot -p", 15000); break;                 // alguns fabricantes bloqueiam sem root; falha calada
+                case "mudo": Adb("-s " + cel + " shell input keyevent 164", 8000); break;              // KEYCODE_VOLUME_MUTE: alterna o som que estiver tocando
+                case "wifi": Alternar(cel, "wifi_on", "svc wifi"); break;
+                case "dados": Alternar(cel, "mobile_data", "svc data"); break;
+                case "bluetooth": Alternar(cel, "bluetooth_on", "svc bluetooth"); break;
+                case "rotacao": AlternarSystem(cel, "accelerometer_rotation"); break;
+                case "nfc": AlternarNfc(cel); break;
+                default: Adb("-s " + cel + " shell monkey -p " + acao + " -c android.intent.category.LAUNCHER 1", 8000); break;   // pacote Android: abre o app
+            }
+        });
+    }
+
+    // le "settings get global <chave>" (0/1) e manda o comando svc contrario do estado atual
+    void Alternar(string cel, string chaveGlobal, string comandoSvc)
+    {
+        bool ligado = Adb("-s " + cel + " shell settings get global " + chaveGlobal, 5000).Trim() == "1";
+        Adb("-s " + cel + " shell " + comandoSvc + (ligado ? " disable" : " enable"), 8000);
+    }
+
+    // rotacao automatica: so existe como "settings put system", sem comando svc equivalente
+    void AlternarSystem(string cel, string chaveSystem)
+    {
+        bool ligado = Adb("-s " + cel + " shell settings get system " + chaveSystem, 5000).Trim() == "1";
+        Adb("-s " + cel + " shell settings put system " + chaveSystem + " " + (ligado ? "0" : "1"), 5000);
+    }
+
+    // NFC nao tem "settings global" confiavel entre versoes/fabricantes: le o estado direto do servico
+    void AlternarNfc(string cel)
+    {
+        string saida = Adb("-s " + cel + " shell dumpsys nfc", 5000);
+        bool ligado = false;
+        foreach (var l in saida.Split('\n')) { var t = l.Trim(); if (t.StartsWith("mState=")) { ligado = t.Substring(7).Trim() == "on"; break; } }
+        Adb("-s " + cel + " shell svc nfc " + (ligado ? "disable" : "enable"), 8000);
+    }
+
+    public string Adb(string args, int ms = 5000)
     {
         try
         {
@@ -772,6 +934,8 @@ class App : ApplicationContext
         miSom.Click += (s, e) => { Cfg.Som = !Cfg.Som; som.Ligado = Cfg.Som; miSom.Checked = Cfg.Som; som.Espera = DateTime.MinValue; Cfg.Gravar(); Ciclo(); };
         var miOrg = new ToolStripMenuItem("Organizar telas...");
         miOrg.Click += (s, e) => Organizar();
+        var miAtalhos = new ToolStripMenuItem("Configurar atalhos...");
+        miAtalhos.Click += (s, e) => AbrirAtalhos();
         var miCel = new ToolStripMenuItem("Celular");
         miCel.DropDownItems.Add("(procurando...)");
         miCel.DropDownOpening += (s, e) =>
@@ -797,11 +961,12 @@ class App : ApplicationContext
             "\"Mostrar a tela do celular\" abre uma janela com a tela dele. Fechar essa janela não fecha o Italophone.\n\n" +
             "O som do celular toca no notebook enquanto o cabo estiver ligado.\n\n" +
             "A área de transferência é compartilhada: copiar em qualquer lado cola no outro. Enquanto o cabo está ligado, o celular usa um teclado vazio (sem Gboard) para poder ler a área de transferência dele; o Gboard volta sozinho ao desconectar.\n\n" +
-            "Com mais de um celular no cabo, escolha qual usar em \"Celular\".",
+            "Com mais de um celular no cabo, escolha qual usar em \"Celular\".\n\n" +
+            "Com o mouse dentro do celular, uma combinação de teclas pode abrir um app ou executar uma ação nele; configure em \"Configurar atalhos...\". Vale qualquer tecla, inclusive as de volume e mídia do teclado.",
             "Italophone");
         var miSair = new ToolStripMenuItem("Sair");
         miSair.Click += (s, e) => Encerrar();
-        menu.Items.AddRange(new ToolStripItem[] { miMouse, miMidia, miClip, miTela, miSom, new ToolStripSeparator(), miCel, miOrg, miAjuda, miSair });
+        menu.Items.AddRange(new ToolStripItem[] { miMouse, miMidia, miClip, miTela, miSom, new ToolStripSeparator(), miCel, miOrg, miAtalhos, miAjuda, miSair });
         ni.ContextMenuStrip = menu;
         ni.DoubleClick += (s, e) => Organizar();
         ni.Visible = true;
@@ -842,9 +1007,44 @@ class App : ApplicationContext
     bool avisouPermitir;
 
     // sem celular escolhido, fica com o primeiro que aparecer no cabo; avisa se falta permitir a depuracao
+    // Interfaces de depuracao USB que o Windows ve no cabo agora (-1 = nao deu para consultar)
+    static int InterfacesAdbNoUsb()
+    {
+        try
+        {
+            using (var s = new System.Management.ManagementObjectSearcher(
+                "SELECT Name FROM Win32_PnPEntity WHERE PNPClass='AndroidUsbDeviceClass' OR Name LIKE '%ADB Interface%'"))
+            using (var r = s.Get())
+                return r.Count;
+        }
+        catch { return -1; }
+    }
+
+    // O servidor do adb as vezes trava e deixa de ver um celular que esta no cabo (comum quando
+    // outro programa abre outra versao do adb). Se o Windows ve mais celulares do que o adb por
+    // dois ciclos seguidos, reinicia o adb (no maximo uma vez por minuto).
+    int ciclosAdbCego;
+    DateTime proxReinicioAdb;
+    List<string[]> ConferirAdb(List<string[]> l)
+    {
+        if (InterfacesAdbNoUsb() <= l.Count) { ciclosAdbCego = 0; return l; }
+        if (++ciclosAdbCego < 2 || DateTime.Now < proxReinicioAdb) return l;
+        ciclosAdbCego = 0;
+        proxReinicioAdb = DateTime.Now.AddMinutes(1);
+        Log("o adb nao ve um celular que esta no cabo; reiniciando o adb");
+        Adb("kill-server", 5000);
+        foreach (var p in Process.GetProcessesByName("adb"))
+        {
+            try { p.Kill(); p.WaitForExit(2000); } catch { }
+            p.Dispose();
+        }
+        Adb("start-server", 15000);
+        return ListarCelulares();
+    }
+
     void ProcurarCelular()
     {
-        var l = ListarCelulares();
+        var l = ConferirAdb(ListarCelulares());
         if (Cfg.Celular == "")
         {
             foreach (var c in l)
@@ -1145,6 +1345,16 @@ class App : ApplicationContext
 
     public void AbrirPeloIniciar() { Organizar(); }
 
+    // ---------------------------------------------------------------- configurar atalhos
+    Atalhos atalhos;
+    public void AbrirAtalhos()
+    {
+        if (atalhos != null && !atalhos.IsDisposed) { atalhos.Activate(); return; }
+        atalhos = new Atalhos(this);
+        atalhos.Show();
+        atalhos.Activate();
+    }
+
     // ---------------------------------------------------------------- ganchos (mouse e teclado)
     void IniciarGanchos()
     {
@@ -1214,6 +1424,15 @@ class App : ApplicationContext
     static bool BotaoApertado()
     {
         return (Nat.GetAsyncKeyState(0x01) < 0) || (Nat.GetAsyncKeyState(0x02) < 0) || (Nat.GetAsyncKeyState(0x04) < 0);
+    }
+
+    // shift/ctrl/alt/win, genericos (0x10/0x11/0x12/0x5B/0x5C) OU especificos de lado (0xA0-0xA5):
+    // o teclado real manda o especifico (confirmado por log), por isso o gancho nunca trata esses
+    // vk's como "tecla principal" de uma macro
+    static bool EModificador(int vk)
+    {
+        return vk == 0x10 || vk == 0x11 || vk == 0x12 || vk == 0x5B || vk == 0x5C ||
+               (vk >= 0xA0 && vk <= 0xA5);
     }
 
     IntPtr GanchoMouse(int code, IntPtr w, IntPtr l)
@@ -1398,15 +1617,46 @@ class App : ApplicationContext
 
     IntPtr GanchoTeclado(int code, IntPtr w, IntPtr l)
     {
-        if (code < 0 || !dentro) return Nat.CallNextHookEx(IntPtr.Zero, code, w, l);
-        var k = (Nat.KBDLL)Marshal.PtrToStructure(l, typeof(Nat.KBDLL));
+        if (code < 0) return Nat.CallNextHookEx(IntPtr.Zero, code, w, l);
+        var k0 = (Nat.KBDLL)Marshal.PtrToStructure(l, typeof(Nat.KBDLL));
+        // estado de ctrl/alt/shift/win: atualizado SEMPRE (mesmo fora do "dentro"), pra nao perder o
+        // segurar se o mouse entra no celular com a tecla ja pressionada. GetAsyncKeyState do codigo
+        // generico nao refletia de forma confiavel o especifico de lado que este teclado manda
+        // (confirmado por log e teste isolado em 10/11), por isso o estado vem so daqui
+        if (EModificador(k0.vk))
+        {
+            bool sol = (k0.flags & 0x80) != 0;
+            bool v = !sol;
+            if (k0.vk == 0x10 || (k0.vk >= 0xA0 && k0.vk <= 0xA1)) modShift = v;
+            else if (k0.vk == 0x11 || (k0.vk >= 0xA2 && k0.vk <= 0xA3)) modCtrl = v;
+            else if (k0.vk == 0x12 || (k0.vk >= 0xA4 && k0.vk <= 0xA5)) modAlt = v;
+            else modWin = v;
+        }
+        if (!dentro) return Nat.CallNextHookEx(IntPtr.Zero, code, w, l);
+        var k = k0;
         try
         {
             bool solta = (k.flags & 0x80) != 0;
             bool ext = (k.flags & 0x01) != 0;
             // o AltGr do ABNT2 manda um Ctrl falso junto (scan 0x21D): ignorar
             if ((k.scan & 0x200) != 0) return (IntPtr)1;
-            // teclas de volume e musica: no celular (opcao do menu) ou no notebook
+            // macro de teclado ("Configurar atalhos..." no menu, ou config.txt "macro=combo=acao"):
+            // ctrl/alt/shift/win + uma tecla, inclusive as de volume/midia e as de atalho dedicadas.
+            // Tem prioridade sobre o uso padrao delas. So olha teclas que nao sejam elas mesmas
+            // modificador; o estado dos modificadores vem do que ja vimos passar pelo proprio gancho
+            // (modCtrl/modAlt/modShift/modWin acima), nao de GetAsyncKeyState
+            if (Cfg.Macros.Count > 0 && !EModificador(k.vk))
+            {
+                long chave = Config.ChaveCombo(modCtrl, modAlt, modShift, modWin, k.vk);
+                string acao;
+                if (Cfg.Macros.TryGetValue(chave, out acao))
+                {
+                    if (solta) teclasMacro.Remove(k.vk);
+                    else if (teclasMacro.Add(k.vk)) DispararMacro(acao);   // Add==false: tecla repetindo ao segurar
+                    return (IntPtr)1;
+                }
+            }
+            // teclas de volume e musica sem macro: no celular (opcao do menu) ou no notebook
             if (k.vk >= 0xAD && k.vk <= 0xB3)
             {
                 if (!Cfg.Midia) return Nat.CallNextHookEx(IntPtr.Zero, code, w, l);
@@ -1414,6 +1664,8 @@ class App : ApplicationContext
                 serv.Midia(solta ? 0 : usos[k.vk - 0xAD]);
                 return (IntPtr)1;
             }
+            // teclas de atalho do teclado (Correio, Midia, App1, Calculadora) sem macro: seguem
+            // normais no Windows (no HID nao fariam nada no celular mesmo)
             if (k.vk >= 0xB4 && k.vk <= 0xB7) return Nat.CallNextHookEx(IntPtr.Zero, code, w, l);
             byte u = Teclas.Hid(k.vk, k.scan & 0xFF, ext);
             if (u == 0) return (IntPtr)1;
@@ -1452,8 +1704,72 @@ class App : ApplicationContext
     }
 }
 
+// As janelas do programa sao desenhadas a 96 dpi (100%). O projeto compila com o csc.exe cru, sem
+// manifest/app.config, entao o WinForms classico NAO sabe que o processo e per-monitor-dpi-aware
+// (isso so e levado em conta pelo AutoScaleMode.Dpi quando o app faz o "opt-in" novo do .NET
+// Framework 4.7+ por manifest/config): sozinho, ele acha que o dpi "atual" e sempre 96 e nunca
+// reescala nada, enquanto o Windows (porque o processo PEDIU per-monitor-v2 em SetProcessDpiAware-
+// nessContext) desenha o texto (fonte em pontos) já no dpi real do monitor — daí o descompasso
+// (texto maior, controles no lugar de sempre, cortando a janela). Essa base reescala a mao: uma vez
+// ao abrir (OnLoad, quando o Windows ja decidiu em que monitor/dpi a janela vai aparecer) E de novo
+// sempre que a janela for ARRASTADA pra um monitor de dpi diferente (WM_DPICHANGED, que so chega
+// porque o processo e per-monitor-v2 — sem isso o `AutoScaleMode.Dpi` sozinho so cobre a abertura,
+// nunca um arrasto ao vivo entre monitores).
+class DialogDpi : Form
+{
+    [DllImport("user32.dll")] static extern int GetDpiForWindow(IntPtr hWnd);
+    const int WM_DPICHANGED = 0x02E0;
+
+    int dpiAtual = 96;
+
+    // desliga o autoscale proprio do WinForms (reagiria sozinho a troca de Font abaixo, escalando
+    // tudo de novo por cima do que ja escalamos a mao)
+    public DialogDpi() { AutoScaleMode = AutoScaleMode.None; }
+
+    protected override void OnLoad(EventArgs e)
+    {
+        base.OnLoad(e);
+        int dpi = GetDpiForWindow(Handle);
+        if (dpi <= 0) dpi = 96;
+        dpiAtual = dpi;
+        float esc = dpi / 96f;
+        if (Math.Abs(esc - 1f) < 0.01f) return;
+        Font = new Font(Font.FontFamily, Font.Size * esc, Font.Style);   // os controles herdam (nenhum tem Font proprio)
+        ClientSize = new Size((int)Math.Round(ClientSize.Width * esc), (int)Math.Round(ClientSize.Height * esc));
+        ReescalarFilhos(Controls, esc);
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_DPICHANGED)
+        {
+            int novoDpi = (int)((long)m.WParam & 0xFFFF);
+            float esc = novoDpi / (float)dpiAtual;
+            if (Math.Abs(esc - 1f) > 0.01f)
+            {
+                Font = new Font(Font.FontFamily, Font.Size * esc, Font.Style);
+                ReescalarFilhos(Controls, esc);
+                var r = (Nat.RECT)Marshal.PtrToStructure(m.LParam, typeof(Nat.RECT));
+                Bounds = new Rectangle(r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top);   // retangulo que o Windows ja sugere pro dpi novo
+            }
+            dpiAtual = novoDpi;
+        }
+        base.WndProc(ref m);
+    }
+
+    static void ReescalarFilhos(Control.ControlCollection cs, float esc)
+    {
+        foreach (Control c in cs)
+        {
+            c.Location = new Point((int)Math.Round(c.Location.X * esc), (int)Math.Round(c.Location.Y * esc));
+            c.Size = new Size((int)Math.Round(c.Size.Width * esc), (int)Math.Round(c.Size.Height * esc));
+            if (c.Controls.Count > 0) ReescalarFilhos(c.Controls, esc);
+        }
+    }
+}
+
 // ===================================================================== janela "Organizar telas"
-class Organizador : Form
+class Organizador : DialogDpi
 {
     readonly App app;
     readonly Panel area;
@@ -1475,7 +1791,6 @@ class Organizador : Form
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false; MinimizeBox = false;
         Font = new Font("Segoe UI", 10f);
-        AutoScaleMode = AutoScaleMode.Dpi;
         ClientSize = new Size(760, 560);
         BackColor = Color.White;
 
@@ -1658,6 +1973,373 @@ class Organizador : Form
         c.Gravar();
         app.AtualizarGeometria();
         app.Log("telas organizadas: " + lado + " de " + monitor + ", inicio " + c.Inicio + ", velocidade " + c.Velocidade);
+        Close();
+    }
+}
+
+// ===================================================================== nome bonito do app (Play Store)
+// O Android (sem root/aapt) nao devolve o nome legivel de um pacote por adb, so classe/pacote. Em
+// vez de mostrar "com.nvt.cs" no "Escolher instalado...", busca o titulo da pagina publica do app
+// na Play Store pelo id do pacote (nenhum dado do Ítalo entra nisso, só o pacote); sem internet ou
+// sem pagina na Play Store, mostra o pacote mesmo. Guarda em cache (por pacote) para não repetir.
+static class NomesApp
+{
+    static readonly Dictionary<string, string> cache = new Dictionary<string, string>();
+    static readonly HttpClient http = CriarHttp();
+    static string arquivo;
+
+    static HttpClient CriarHttp()
+    {
+        var h = new HttpClientHandler { UseCookies = false, AllowAutoRedirect = true };
+        var c = new HttpClient(h) { Timeout = TimeSpan.FromSeconds(5) };
+        c.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (compatible; Italophone)");
+        return c;
+    }
+
+    // le o cache em disco (pacote=nome, um por linha) ao abrir o programa, pra nunca mais buscar de
+    // novo um app ja conhecido de uma vez anterior
+    public static void Inicializar(string arq)
+    {
+        arquivo = arq;
+        try
+        {
+            if (!File.Exists(arq)) return;
+            foreach (var l in File.ReadAllLines(arq))
+            {
+                var p = l.Split(new[] { '=' }, 2);
+                if (p.Length == 2 && p[0].Trim() != "") cache[p[0].Trim()] = p[1].Trim();
+            }
+        }
+        catch { }
+    }
+
+    static void Salvar()
+    {
+        if (arquivo == null) return;
+        try
+        {
+            var sb = new StringBuilder();
+            lock (cache) { foreach (var kv in cache) sb.AppendLine(kv.Key + "=" + kv.Value); }
+            File.WriteAllText(arquivo, sb.ToString(), new UTF8Encoding(false));
+        }
+        catch { }
+    }
+
+    public static async Task<string> Buscar(string pacote)
+    {
+        lock (cache) { string v; if (cache.TryGetValue(pacote, out v)) return v; }
+        string nome = pacote;
+        try
+        {
+            string html = await http.GetStringAsync("https://play.google.com/store/apps/details?id=" + Uri.EscapeDataString(pacote) + "&hl=pt_BR&gl=BR");
+            var m = Regex.Match(html, "<title[^>]*>(.*?)</title>", RegexOptions.Singleline);
+            if (m.Success)
+            {
+                string t = System.Net.WebUtility.HtmlDecode(m.Groups[1].Value).Trim();
+                foreach (var sufixo in new[] { " - Apps no Google Play", " – Apps no Google Play", " - Apps on Google Play", " – Apps on Google Play" })
+                {
+                    int i = t.IndexOf(sufixo, StringComparison.OrdinalIgnoreCase);
+                    if (i > 0) { t = t.Substring(0, i); break; }
+                }
+                if (t.Trim() != "") nome = t.Trim();
+            }
+        }
+        catch { }
+        lock (cache) { cache[pacote] = nome; }
+        if (nome != pacote) Salvar();   // so grava em disco o que achou de verdade; "nao achou" fica so na memoria, pra tentar de novo na proxima vez
+        return nome;
+    }
+}
+
+// ===================================================================== configurar atalhos
+class Atalhos : DialogDpi
+{
+    readonly App app;
+    readonly ListView lista;
+
+    public Atalhos(App app)
+    {
+        this.app = app;
+        Text = "Italophone - Atalhos de teclado";
+        try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+        StartPosition = FormStartPosition.CenterScreen;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false; MinimizeBox = false;
+        Font = new Font("Segoe UI", 10f);
+        ClientSize = new Size(520, 420);
+        BackColor = Color.White;
+
+        string textoDica = "Com o mouse dentro do celular, a combinação de teclas abre o app ou executa a ação escolhida.";
+        var dica = new Label { Text = textoDica, Location = new Point(16, 10), AutoSize = true, MaximumSize = new Size(488, 0) };
+        // a dica quebra em 2 linhas: "dica.Bottom" nao da a altura certa antes do controle estar na
+        // janela (o AutoSize so mede direito depois); mede a mao pra calcular onde a lista comeca
+        int alturaDica = TextRenderer.MeasureText(textoDica, Font, new Size(488, 0), TextFormatFlags.WordBreak).Height;
+        int yLista = 10 + alturaDica + 12;
+        lista = new ListView
+        {
+            Location = new Point(16, yLista), Size = new Size(488, 322 - yLista),
+            View = View.Details, FullRowSelect = true, MultiSelect = false, HideSelection = false
+        };
+        lista.Columns.Add("Teclas", 130);
+        lista.Columns.Add("Ação", 340);
+        lista.DoubleClick += (s, e) => Editar();
+
+        var add = new Button { Text = "Adicionar...", Location = new Point(16, 332), Size = new Size(110, 32) };
+        var editar = new Button { Text = "Editar...", Location = new Point(134, 332), Size = new Size(100, 32) };
+        var remover = new Button { Text = "Remover", Location = new Point(242, 332), Size = new Size(100, 32) };
+        add.Click += (s, e) => Adicionar();
+        editar.Click += (s, e) => Editar();
+        remover.Click += (s, e) => Remover();
+
+        var fechar = new Button { Text = "Fechar", Location = new Point(414, 372), Size = new Size(90, 32) };
+        fechar.Click += (s, e) => Close();
+        CancelButton = fechar;
+
+        Controls.AddRange(new Control[] { dica, lista, add, editar, remover, fechar });
+        Carregar();
+    }
+
+    void Carregar()
+    {
+        lista.Items.Clear();
+        foreach (var m in app.Cfg.Lista)
+        {
+            int idxAcao = Array.IndexOf(App.AcoesFixas, m.Acao);
+            string texto = idxAcao >= 0 ? App.AcoesFixasTexto[idxAcao] : m.Acao;
+            var it = new ListViewItem(new[] { m.Combo, texto });
+            it.Tag = m;
+            lista.Items.Add(it);
+            if (idxAcao < 0) ResolverNomeNaLista(it, m.Acao);   // pacote Android: busca o nome bonito em segundo plano
+        }
+    }
+
+    async void ResolverNomeNaLista(ListViewItem it, string pacote)
+    {
+        string nome = await NomesApp.Buscar(pacote);
+        if (IsDisposed || nome == pacote || it.ListView == null) return;
+        it.SubItems[1].Text = nome + "  (" + pacote + ")";
+    }
+
+    void Adicionar()
+    {
+        var dlg = new NovoAtalho(app, null);
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+        app.Cfg.Lista.Add(dlg.Resultado);
+        app.Cfg.ReconstruirMacros();
+        app.Cfg.Gravar();
+        Carregar();
+    }
+
+    void Editar()
+    {
+        if (lista.SelectedItems.Count == 0) return;
+        var m = (Config.ItemMacro)lista.SelectedItems[0].Tag;
+        var dlg = new NovoAtalho(app, m);
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+        m.Combo = dlg.Resultado.Combo; m.Acao = dlg.Resultado.Acao;
+        app.Cfg.ReconstruirMacros();
+        app.Cfg.Gravar();
+        Carregar();
+    }
+
+    void Remover()
+    {
+        if (lista.SelectedItems.Count == 0) return;
+        var m = (Config.ItemMacro)lista.SelectedItems[0].Tag;
+        app.Cfg.Lista.Remove(m);
+        app.Cfg.ReconstruirMacros();
+        app.Cfg.Gravar();
+        Carregar();
+    }
+}
+
+class NovoAtalho : DialogDpi
+{
+    readonly App app;
+    readonly TextBox txtCombo, txtPacote;
+    readonly ComboBox cboAcao;
+    readonly Button btnEscolherApp;
+    readonly Label lblNomeApp;
+    readonly System.Windows.Forms.Timer timerNome = new System.Windows.Forms.Timer();
+    public Config.ItemMacro Resultado;
+
+    static readonly string[] AcoesFixas = App.AcoesFixas;
+    static readonly string[] AcoesTexto = App.AcoesFixasTexto;
+
+    public NovoAtalho(App app, Config.ItemMacro existente)
+    {
+        this.app = app;
+        Text = existente == null ? "Italophone - Novo atalho" : "Italophone - Editar atalho";
+        try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+        StartPosition = FormStartPosition.CenterParent;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false; MinimizeBox = false;
+        Font = new Font("Segoe UI", 10f);
+        ClientSize = new Size(420, 272);
+        BackColor = Color.White;
+
+        var l1 = new Label { Text = "Teclas (clique na caixa e pressione a combinação):", Location = new Point(16, 14), AutoSize = true };
+        txtCombo = new TextBox { Location = new Point(16, 38), Size = new Size(388, 26), ReadOnly = true, Text = existente != null ? existente.Combo : "" };
+        txtCombo.KeyDown += Capturar;
+
+        var l2 = new Label { Text = "Ação:", Location = new Point(16, 78), AutoSize = true };
+        cboAcao = new ComboBox { Location = new Point(16, 100), Size = new Size(388, 26), DropDownStyle = ComboBoxStyle.DropDownList };
+        cboAcao.Items.Add("Abrir um app do celular");
+        cboAcao.Items.AddRange(AcoesTexto);
+        cboAcao.SelectedIndexChanged += (s, e) => AtualizarCampoPacote();
+
+        txtPacote = new TextBox { Location = new Point(16, 134), Size = new Size(280, 26) };
+        btnEscolherApp = new Button { Text = "Escolher instalado...", Location = new Point(304, 133), Size = new Size(100, 28) };
+        btnEscolherApp.Click += (s, e) => EscolherApp();
+        lblNomeApp = new Label { Location = new Point(16, 164), AutoSize = true, MaximumSize = new Size(388, 0), ForeColor = Color.DimGray };
+        txtPacote.TextChanged += (s, e) => { timerNome.Stop(); timerNome.Start(); };
+        timerNome.Interval = 500;
+        timerNome.Tick += async (s, e) => { timerNome.Stop(); await AtualizarNomeApp(); };
+
+        var ok = new Button { Text = "Salvar", Location = new Point(224, 218), Size = new Size(90, 32) };
+        var cancelar = new Button { Text = "Cancelar", Location = new Point(320, 218), Size = new Size(84, 32) };
+        ok.Click += (s, e) => Salvar();
+        cancelar.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
+        AcceptButton = ok; CancelButton = cancelar;
+
+        Controls.AddRange(new Control[] { l1, txtCombo, l2, cboAcao, txtPacote, btnEscolherApp, lblNomeApp, ok, cancelar });
+        if (existente != null && Array.IndexOf(AcoesFixas, existente.Acao) < 0) AtualizarNomeApp();
+
+        if (existente != null)
+        {
+            int idxAcao = Array.IndexOf(AcoesFixas, existente.Acao);
+            if (idxAcao >= 0) cboAcao.SelectedIndex = idxAcao + 1;
+            else { cboAcao.SelectedIndex = 0; txtPacote.Text = existente.Acao; }
+        }
+        else cboAcao.SelectedIndex = 0;
+        AtualizarCampoPacote();
+    }
+
+    // captura a combinacao pressionada direto na caixa (nao precisa saber o nome da tecla: o
+    // Windows manda o mesmo codigo tanto para letras/F/setas quanto para volume, midia e as
+    // teclas de atalho dedicadas do teclado)
+    void Capturar(object sender, KeyEventArgs e)
+    {
+        e.Handled = true; e.SuppressKeyPress = true;
+        int vk = (int)e.KeyCode;
+        if (vk == 0x10 || vk == 0x11 || vk == 0x12 || vk == 0x5B || vk == 0x5C) return;   // so o modificador: espera a tecla principal
+        bool win = Nat.GetAsyncKeyState(0x5B) < 0 || Nat.GetAsyncKeyState(0x5C) < 0;
+        txtCombo.Text = Config.TextoCombo(e.Control, e.Alt, e.Shift, win, vk);
+    }
+
+    void AtualizarCampoPacote()
+    {
+        bool abrirApp = cboAcao.SelectedIndex == 0;
+        txtPacote.Visible = abrirApp;
+        btnEscolherApp.Visible = abrirApp;
+        lblNomeApp.Visible = abrirApp;
+        if (abrirApp) AtualizarNomeApp();
+    }
+
+    // mostra embaixo da caixa do pacote o nome do app (Play Store), se achar
+    async Task AtualizarNomeApp()
+    {
+        string pacote = txtPacote.Text.Trim();
+        if (pacote == "" || !pacote.Contains(".")) { lblNomeApp.Text = ""; return; }
+        lblNomeApp.Text = "procurando o nome do app...";
+        string nome = await NomesApp.Buscar(pacote);
+        if (IsDisposed || txtPacote.Text.Trim() != pacote) return;
+        lblNomeApp.Text = nome == pacote ? "" : "app: " + nome;
+    }
+
+    async void EscolherApp()
+    {
+        btnEscolherApp.Enabled = false;
+        Cursor = Cursors.WaitCursor;
+        try
+        {
+            string saida = await Task.Run(() => app.Adb("-s " + app.Cfg.Celular + " shell pm list packages -3", 8000));
+            var pacotes = new List<string>();
+            foreach (var linha in saida.Split('\n'))
+            {
+                var l = linha.Trim();
+                if (l.StartsWith("package:")) pacotes.Add(l.Substring(8).Trim());
+            }
+            if (pacotes.Count == 0) { MessageBox.Show(this, "Não encontrei apps instalados no celular (ele está no cabo?).", "Italophone"); return; }
+            var itens = new List<ItemApp>();
+            using (var sem = new SemaphoreSlim(8))
+            {
+                var tarefas = pacotes.Select(async p =>
+                {
+                    await sem.WaitAsync();
+                    try { return new ItemApp { Nome = await NomesApp.Buscar(p), Pacote = p }; }
+                    finally { sem.Release(); }
+                }).ToList();
+                itens.AddRange(await Task.WhenAll(tarefas));
+            }
+            itens.Sort((a, b) => string.Compare(a.Nome, b.Nome, StringComparison.OrdinalIgnoreCase));
+            using (var dlg = new EscolherDaLista("Escolher app", itens))
+            {
+                if (dlg.ShowDialog(this) == DialogResult.OK) txtPacote.Text = dlg.Escolhido;
+            }
+        }
+        finally
+        {
+            Cursor = Cursors.Default;
+            btnEscolherApp.Enabled = true;
+        }
+    }
+
+    void Salvar()
+    {
+        if (txtCombo.Text.Trim() == "") { MessageBox.Show(this, "Pressione a combinação de teclas desse atalho.", "Italophone"); return; }
+        long chave;
+        if (!Config.AnalisarCombo(txtCombo.Text, out chave)) { MessageBox.Show(this, "Combinação inválida.", "Italophone"); return; }
+        string acao = cboAcao.SelectedIndex == 0 ? txtPacote.Text.Trim() : AcoesFixas[cboAcao.SelectedIndex - 1];
+        if (acao == "") { MessageBox.Show(this, "Informe o pacote do app a abrir.", "Italophone"); return; }
+        Resultado = new Config.ItemMacro { Combo = txtCombo.Text, Acao = acao };
+        DialogResult = DialogResult.OK;
+        Close();
+    }
+}
+
+// um app instalado no celular: nome bonito (Play Store, ou o proprio pacote se nao achar) + pacote
+class ItemApp
+{
+    public string Nome, Pacote;
+    public override string ToString() { return Nome == Pacote ? Pacote : Nome + "  (" + Pacote + ")"; }
+}
+
+class EscolherDaLista : DialogDpi
+{
+    readonly ListBox lb;
+    public string Escolhido;
+
+    public EscolherDaLista(string titulo, List<ItemApp> itens)
+    {
+        Text = "Italophone - " + titulo;
+        try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
+        StartPosition = FormStartPosition.CenterParent;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false; MinimizeBox = false;
+        Font = new Font("Segoe UI", 10f);
+        ClientSize = new Size(440, 420);
+        BackColor = Color.White;
+
+        lb = new ListBox { Location = new Point(16, 16), Size = new Size(408, 348) };
+        lb.Items.AddRange(itens.ToArray());
+        lb.DoubleClick += (s, e) => Escolher();
+
+        var ok = new Button { Text = "Escolher", Location = new Point(250, 376), Size = new Size(90, 32) };
+        var cancelar = new Button { Text = "Cancelar", Location = new Point(344, 376), Size = new Size(80, 32) };
+        ok.Click += (s, e) => Escolher();
+        cancelar.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
+        AcceptButton = ok; CancelButton = cancelar;
+
+        Controls.AddRange(new Control[] { lb, ok, cancelar });
+    }
+
+    void Escolher()
+    {
+        var item = lb.SelectedItem as ItemApp;
+        if (item == null) return;
+        Escolhido = item.Pacote;
+        DialogResult = DialogResult.OK;
         Close();
     }
 }
